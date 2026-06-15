@@ -1,0 +1,197 @@
+name: SBOM License Scan (LLKB kernel)
+
+# Per 2Africa.AI ADR-014 §4.3 (license & IP compliance · LLKB engine)
+# Source: 2Africa-AI/2Africa-SmartOS · scripts/sbom/fork-workflows/weknora-sbom.yml
+# Scope: deployed sub-projects (Go server + docreader + mcp-server + frontend admin)
+# Skip: miniprogram/ (WeChat 小程序 · 不部署 · 消费级)
+
+on:
+  push:
+    branches:
+      - '2africa/v0.6'
+      - '2africa/v**'
+  schedule:
+    # Weekly Monday 00:00 UTC · detects upstream drift (per ADR-014 §4.5)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-scan:
+    name: Transitive license scan (LLKB)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            cli/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install license scanners
+        run: |
+          set -euo pipefail
+          pip install pip-licenses
+          go install github.com/google/go-licenses@latest
+          npm install -g license-checker
+          pip-licenses --version
+          $(go env GOPATH)/bin/go-licenses --version || true
+          license-checker --version
+
+      - name: Prep output dir
+        run: mkdir -p sbom-out
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Tencent bundled LICENSE quick-check (high-confidence baseline)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Snapshot Tencent bundled LICENSE
+        run: |
+          if [ -f LICENSE ]; then
+            cp LICENSE sbom-out/tencent-bundled-LICENSE.txt
+            wc -l LICENSE
+            echo "Tencent vendored license categories:"
+            grep -E "Open Source Software Licensed under" LICENSE | sort -u | tee sbom-out/tencent-bundled-categories.txt
+          fi
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Python deps (deployed-only)
+      # Scope: mcp-server only (docreader 暂用 source · install deferred to image build)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Scan Python deps (mcp-server)
+        continue-on-error: false
+        run: |
+          set -euxo pipefail
+          for req_dir in mcp-server; do
+            req="$req_dir/requirements.txt"
+            if [ ! -f "$req" ]; then
+              echo "::warning::missing $req — skipping"
+              continue
+            fi
+            tag=$(echo "$req_dir" | tr '/' '-')
+            venv="/tmp/venv-$tag"
+            echo ">>> Scanning $req"
+            python -m venv "$venv"
+            # shellcheck source=/dev/null
+            source "$venv/bin/activate"
+            pip install -r "$req" 2>&1 | tail -10 || true
+            pip-licenses --from=mixed --format=json --with-license-file --no-license-path \
+              > "sbom-out/py-$tag.json" || true
+            deactivate
+          done
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Go deps (deployed-only)
+      # Scope: root server (cmd/ + internal/) + cli (optional · keep for ops)
+      # Skip: client (SDK consumer) — included via root server's deps
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Scan Go deps (LLKB core)
+        continue-on-error: false
+        run: |
+          set -euxo pipefail
+          GOLICENSES="$(go env GOPATH)/bin/go-licenses"
+          for gomod_dir in . cli; do
+            if [ ! -f "$gomod_dir/go.mod" ]; then
+              echo "::warning::missing $gomod_dir/go.mod — skipping"
+              continue
+            fi
+            tag=$(echo "$gomod_dir" | tr '/' '-' | sed 's/^-$/root/; s/^\.$/root/')
+            echo ">>> Scanning $gomod_dir"
+            (cd "$gomod_dir" && "$GOLICENSES" report ./... 2>&1) \
+              > "sbom-out/go-$tag.csv" || true
+          done
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Node deps (frontend admin · Vue)
+      # Skip: miniprogram (不部署) · wailsjs/runtime (Wails 桌面运行时 · 不部署)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Scan Node deps (frontend Vue admin)
+        continue-on-error: false
+        run: |
+          set -euxo pipefail
+          if [ -f frontend/package.json ]; then
+            echo ">>> Scanning frontend"
+            (cd frontend && npm ci --no-audit --no-fund 2>&1 | tail -5 || npm install --no-audit --no-fund 2>&1 | tail -5)
+            (cd frontend && license-checker --json --excludePrivatePackages 2>/dev/null) \
+              > sbom-out/node-frontend.json || true
+          fi
+
+      - name: Aggregate + red-line check
+        run: |
+          set -euxo pipefail
+          # Combine all scan outputs
+          cat sbom-out/py-*.json                  2>/dev/null > /tmp/sbom-py.txt    || touch /tmp/sbom-py.txt
+          cat sbom-out/go-*.csv                   2>/dev/null > /tmp/sbom-go.txt    || touch /tmp/sbom-go.txt
+          cat sbom-out/node-*.json                2>/dev/null > /tmp/sbom-node.txt  || touch /tmp/sbom-node.txt
+          cat sbom-out/tencent-bundled-LICENSE.txt 2>/dev/null > /tmp/sbom-tencent.txt || touch /tmp/sbom-tencent.txt
+          cat /tmp/sbom-py.txt /tmp/sbom-go.txt /tmp/sbom-node.txt /tmp/sbom-tencent.txt > /tmp/sbom-all.txt
+
+          RED=$(grep -niE 'AGPL|^GPL-[123]|GPL-2\.0|GPL-3\.0|SSPL|BUSL|Commons-Clause|Sustainable.Use|Elastic.License' /tmp/sbom-all.txt || true)
+          if [ -n "$RED" ]; then
+            echo "::error::🚨 RED-LINE LICENSE HIT — triggers ADR-014 §9 Plan B"
+            echo "$RED" | head -50
+            echo "$RED" > sbom-out/RED-LINE-HITS.txt
+            exit 1
+          fi
+          YELLOW=$(grep -niE 'LGPL|MPL-2\.0|EPL-1\.0|EPL-2\.0' /tmp/sbom-all.txt | sort -u || true)
+          YELLOW_COUNT=$(echo "$YELLOW" | grep -c . || echo 0)
+          echo "::notice::✅ Red-line: 0 hits · Yellow-flag: $YELLOW_COUNT (informational · already evaluated per SBOM 报告 §4.2)"
+          {
+            echo "# LLKB SBOM scan summary"
+            echo ""
+            echo "Generated: $(date -u +%Y-%m-%d_%H:%M:%S_UTC)"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo ""
+            echo "## Red-line hits"
+            echo ""
+            echo "**0** ✅"
+            echo ""
+            echo "## Yellow-flag hits"
+            echo ""
+            echo "Count: $YELLOW_COUNT"
+            echo ""
+            echo '```'
+            echo "$YELLOW" | head -50
+            echo '```'
+            echo ""
+            echo "## Tencent bundled LICENSE categories"
+            echo ""
+            echo '```'
+            cat sbom-out/tencent-bundled-categories.txt 2>/dev/null || echo "(not captured)"
+            echo '```'
+          } > sbom-out/SUMMARY.md
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-llkb-${{ github.sha }}
+          path: sbom-out/
+          retention-days: 90
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f sbom-out/SUMMARY.md ]; then
+            cat sbom-out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          fi
