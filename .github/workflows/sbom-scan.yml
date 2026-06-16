@@ -204,4 +204,3 @@ jobs:
           if [ -f sbom-out/SUMMARY.md ]; then
             cat sbom-out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
           fi
-       
